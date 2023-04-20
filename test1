@@ -1,0 +1,375 @@
+def call(Map pipelineParams) {
+
+    if(!pipelineParams.cleanNpm){
+        pipelineParams.cleanNpm = "false"
+    }
+
+    pipelineParams.notify = 'juan.calderon@aldeamo.com,victor.duarte@aldeamo.com,diana.jaimes@aldeamo.com,luis.gonzalez@aldeamo.com,victor.amarillo@aldeamo.com'
+    pipelineParams.testRun = '0'
+    pipelineParams.vulnerabilities = 0
+    pipelineParams.codesmell = 0
+    pipelineParams.coverage = 0
+    pipelineParams.issues = 0
+    pipelineParams.deployments = 0
+    pipelineParams.ipSonar = '192.168.100.150'
+    pipelineParams.userSonar = 'admin'
+    pipelineParams.passSonar = 'admin'
+    pipelineParams.serviceVersion = ''
+    pipelineParams.jarName = ''
+    pipelineParams.ipAudit = '192.168.100.150'
+
+    pipeline {
+        agent any
+
+        tools{
+            maven 'MAVEN'
+            jdk 'java ' + pipelineParams.javaVersion
+        }
+
+        environment {
+            scannerHome = tool 'sonarAldeamo2'
+        }
+
+        stages {
+
+            stage('Valid parameters') {
+                steps {
+                    script {
+                        echo '--------------------------------[ Started get parameters ]--------------------------------'
+                        functions.validParameters(pipelineParams)
+                        echo '--------------------------------[ Ended get parameters ]--------------------------------'
+                    }
+                }
+            }
+
+            stage('Permission validation to deploy') {
+                steps {
+                    script {
+                        functions.permissionValidationToDeploy(pipelineParams)
+                    }
+                }
+            }
+
+            stage('Remove dependencies') {
+                when { expression { pipelineParams.skipBuild == "false"} }
+                steps {
+                    echo '--------------------------------[ Started Remove dependencies ]--------------------------------'
+                    script {
+                        functions.removeDependencies(pipelineParams)
+                    }
+                    echo '--------------------------------[ Ended Remove dependencies]--------------------------------'
+                }
+            }
+
+            stage('Checkout git') {
+                when { expression { pipelineParams.skipBuild == "false"} }
+                steps {
+                    echo '--------------------------------[ Started git clone ]--------------------------------'
+                    script {
+                        functions.gitClone(pipelineParams)
+                    }
+                    echo '--------------------------------[ Ended git clone ]--------------------------------'
+                }
+            }
+
+            stage('Replace custom values'){
+                steps{
+                    echo '--------------------------------[ Started Replace custom values ]--------------------------------'
+
+                    script {
+
+                        // Captura variables POM.XML
+                        def exitCoverage = false
+                        try {
+                            def pom = new XmlSlurper().parse(new File("${WORKSPACE}/pom.xml"))
+                            String versionStr = pom.version
+                            String artifactIdStr = pom.artifactId
+                            pipelineParams.serviceVersion = versionStr
+                            pipelineParams.jarName = artifactIdStr + "-" + pipelineParams.serviceVersion + ".jar"
+
+                            def coverageList = []
+                            coverageList = pom.build.plugins.plugin.groupId
+
+                            coverageList.each {
+                                plugin ->
+                                    if (plugin == "org.jacoco") {
+                                        exitCoverage = true
+                                    }
+                            }
+
+                        } catch (Exception ex) {
+                            println(ex)
+                        }
+
+                        if ( pipelineParams.cleanNpm == "false" && !exitCoverage) {
+                            error("No es posible desplegar sin el plugin de Coverage(org.jacoco) en el pom.xml")
+                        }
+
+                        // Se agregan lineas a DockerFile
+                        if (pipelineParams.skipBuild == "false") {
+                            sh "sed -i '\$a \\ \\ \\ \\ network_mode: bridge' ${WORKSPACE}/docker-compose.yml"
+                            sh "sed -i '4 a CMD [\"WORKDIR\", \"/src/main/resources/\"]' ${WORKSPACE}/Dockerfile && sed -i '5 a COPY Files/config/logback-spring.xml /src/main/resources/' ${WORKSPACE}/Dockerfile"
+                        }
+
+                        String[] serviceNames = pipelineParams.serviceName.split(",")
+                        String[] ports = pipelineParams.port.split(",")
+                        String[] profiles = pipelineParams.profile.split(",")
+
+                        // Remplaazo de variables en archivos de despliegue
+                        sh "sed -i 's/__serviceName__/${JOB_BASE_NAME}/g' ${WORKSPACE}/sonar-project.properties"
+                        sh "sed -i '\$a sonar.exclusions=${serviceNames[0]}/src/main/java/**/entities/** , ${serviceNames[0]}/src/main/java/**/model/** , ${serviceNames[0]}/src/main/java/**/dto/** , ${serviceNames[0]}/src/main/java/**/entity/** , ${serviceNames[0]}/src/main/java/**/*DBConfig.java' ${WORKSPACE}/sonar-project.properties"
+                        sh "sed -i 's/__version__/${pipelineParams.serviceVersion}/g' ${WORKSPACE}/*.*"
+                        sh "sed -i 's/__jarName__/${pipelineParams.jarName}/g' ${WORKSPACE}/*.*"
+                        sh "sed -i 's/__jarName__/${pipelineParams.jarName}/g' ${WORKSPACE}/Dockerfile"
+
+                        // Se valida si el proyecto tiene bootstrap y se remplaaza servidor de propiedades
+                        String fileFound = sh returnStdout: true, script: "ls ${WORKSPACE}/src/main/resources/bootstrap.yml |wc -l"
+
+                        if (serviceNames.size() > 1) {
+                            for (int i = 0; i < serviceNames.size(); i++) {
+                                def serviceName = serviceNames[i]
+                                def port = ports[i]
+                                def profile = profiles[i]
+
+                                sh "cp ${WORKSPACE}/Dockerfile ${WORKSPACE}/Dockerfile-${serviceName}"
+                                sh "cp ${WORKSPACE}/docker-compose.yml ${WORKSPACE}/docker-compose-${serviceName}.yml"
+                                sh "cp ${WORKSPACE}/src/main/resources/logback-spring.xml ${WORKSPACE}/src/main/resources/logback-spring-${serviceName}.xml"
+
+                                sh "sed -i 's/__port__/${port}/g' ${WORKSPACE}/Dockerfile-${serviceName}"
+                                sh "sed -i 's/__port__/${port}/g' ${WORKSPACE}/docker-compose-${serviceName}.yml"
+                                sh "sed -i 's/__serviceName__/${serviceName}/g' ${WORKSPACE}/docker-compose-${serviceName}.yml"
+                                sh "sed -i 's/__profile__/${profile}/g' ${WORKSPACE}/docker-compose-${serviceName}.yml"
+
+                                // Cambia nombre de Log para evitar que aparezca con nombre por defecto
+                                sh "sed -i 's/\${LOG_FILE}/${serviceName}/g' ${WORKSPACE}/src/main/resources/logback-spring-${serviceName}.xml"
+                                // Cambia ruta de Log
+                                def path = "\\/logs\\/${serviceName}.log"
+                                sh "sed -i 's/\${LOG_PATH}/${path}/g' ${WORKSPACE}/src/main/resources/logback-spring-${serviceName}.xml"
+
+                                if (fileFound.indexOf("1") > -1 ) {
+                                    sh "cp ${WORKSPACE}/src/main/resources/bootstrap.yml ${WORKSPACE}/src/main/resources/bootstrap-${serviceName}.yml"
+                                    sh "sed -i '/active:/c \\ \\ \\ \\ active: ${profile}' ${WORKSPACE}/src/main/resources/bootstrap-${serviceName}.yml"
+                                    sh "sed -i '/uri:/c \\ \\ \\ \\ \\ \\ uri: http://192.168.100.150:8888' ${WORKSPACE}/src/main/resources/bootstrap-${serviceName}.yml"
+                                }
+
+                            }
+                        } else {
+                            def serviceName = serviceNames[0]
+                            def port = ports[0]
+                            def profile = profiles[0]
+                            sh "sed -i 's/__port__/${port}/g' ${WORKSPACE}/Dockerfile"
+                            sh "sed -i 's/__serviceName__/${serviceName}/g' ${WORKSPACE}/*.*"
+                            sh "sed -i 's/__port__/${port}/g' ${WORKSPACE}/*.*"
+                            sh "sed -i 's/__profile__/${profile}/g' ${WORKSPACE}/*.*"
+
+                            // Cambia nombre de Log para evitar que aparezca con nombre por defecto
+                            sh "sed -i 's/\${LOG_FILE}/${serviceName}/g' ${WORKSPACE}/src/main/resources/logback-spring.xml"
+                            // Cambia ruta de Log
+                            def path = "\\/logs\\/${serviceName}.log"
+                            sh "sed -i 's/\${LOG_PATH}/${path}/g' ${WORKSPACE}/src/main/resources/logback-spring.xml"
+
+                            if (fileFound.indexOf("1") > -1 ) {
+                                sh "sed -i '/active:/c \\ \\ \\ \\ active: ${profile}' ${WORKSPACE}/src/main/resources/bootstrap.yml"
+                                sh "sed -i '/uri:/c \\ \\ \\ \\ \\ \\ uri: http://192.168.100.150:8888' ${WORKSPACE}/src/main/resources/bootstrap.yml"
+                            }
+                        }
+
+                    }
+
+                    echo '--------------------------------[ Ended Replace custom values  ]--------------------------------'
+                }
+            }
+
+            stage('Version validation'){
+                when { expression { pipelineParams.skipBuild == "false"} }
+                steps{
+                    echo '--------------------------------[ Started version validation ]--------------------------------'
+                    script {
+                        boolean isVersionValid = functions.validateVersion(pipelineParams)
+                        if(isVersionValid){
+                            print("Version valida")
+                        }else{
+                            error("No es posible desplegar una version igual o menor a la ultima desplegada, revisar POM")
+                        }
+                    }
+                    echo '--------------------------------[ Ended version validation ]--------------------------------'
+                }
+            }
+
+
+            stage('Mvn install and test'){
+                when { expression { pipelineParams.skipBuild == "false"} }
+                steps{
+                    echo '--------------------------------[ Started maven install and test ]--------------------------------'
+                    script {
+                        functions.mvnInstallAndTest(pipelineParams)
+                    }
+                    echo '--------------------------------[ Ended maven build with executed TESTS ]--------------------------------'
+                }
+            }
+
+            stage('Sonar'){
+                when { expression { pipelineParams.skipBuild == "false"} }
+                steps{
+                    echo '--------------------------------[ Started analysis with sonar ]--------------------------------'
+                    script {
+                        functions.sonar(pipelineParams)
+                    }
+                    echo '--------------------------------[ Ended analysis with sonar  ]--------------------------------'
+                }
+            }
+
+            stage('Folder construction') {
+                steps{
+                    echo '--------------------------------[ Started folder construction and file copying ]--------------------------------'
+                    script {
+
+                        String[] servers = pipelineParams.ipServer.split(",")
+                        echo 'Se desplegara en los servidores: ' + pipelineParams.ipServer
+                        for (server in servers) {
+                            // Se construye objeto con los parametros necesarios para uso de SSH
+                            def remote = [:]
+                            remote.name = 'server'
+                            remote.host = server
+                            remote.allowAnyHosts = true
+
+                            withCredentials([usernamePassword(credentialsId: '8827ee84-4ad4-4266-a11f-1f7f5fd74410', usernameVariable: 'NUSER', passwordVariable: 'NPASS')]) {
+                                remote.user = NUSER
+                                remote.password = NPASS
+                            }
+
+                            String[] serviceNames = pipelineParams.serviceName.split(",")
+
+                            for (int i = 0; i < serviceNames.size(); i++) {
+                                def serviceFolder = "/home/celuman/deployDocker/${serviceNames[i]}"
+
+                                sshCommand remote: remote, command: "mkdir -p ${serviceFolder}/Files/app"
+                                sshCommand remote: remote, command: "mkdir -p ${serviceFolder}/Files/config"
+
+                                if (serviceNames.size() > 1) {
+                                    sshPut remote: remote, from: "Dockerfile-${serviceNames[i]}", into: "${serviceFolder}"
+                                    sshCommand remote: remote, command: "cp ${serviceFolder}/Dockerfile-${serviceNames[i]} ${serviceFolder}/Dockerfile"
+                                } else {
+                                    sshPut remote: remote, from: "Dockerfile", into: "${serviceFolder}"
+                                }
+                                sshPut remote: remote, from: "target/${pipelineParams.jarName}", into: "${serviceFolder}/Files/app"
+
+                                def resources = sh returnStdout: true, script: "ls src/main/resources/"
+                                String[] files = resources.split("\\r\\n|\\n|\\r")
+                                for (file in files) {
+                                    sshPut remote: remote, from: "src/main/resources/" + file, into: "${serviceFolder}/Files/config"
+                                }
+
+                                if (serviceNames.size() > 1) {
+                                    sshPut remote: remote, from: "docker-compose-${serviceNames[i]}.yml", into: "${serviceFolder}"
+
+                                    sshCommand remote: remote, command: "cp ${serviceFolder}/Files/config/logback-spring-${serviceNames[i]}.xml ${serviceFolder}/Files/config/logback-spring.xml"
+                                    sshCommand remote: remote, command: "cp ${serviceFolder}/docker-compose-${serviceNames[i]}.yml ${serviceFolder}/docker-compose.yml"
+                                    sshCommand remote: remote, command: "cp ${serviceFolder}/Files/config/bootstrap-${serviceNames[i]}.yml ${serviceFolder}/Files/config/bootstrap.yml"
+                                } else {
+                                    sshPut remote: remote, from: "docker-compose.yml", into: "${serviceFolder}"
+                                }
+                                sshCommand remote: remote, command: "chown -R celuman:celuman ${serviceFolder}"
+                            }
+
+                        }
+
+                    }
+                    echo '--------------------------------[ Ended folder construction and file copying ]--------------------------------'
+                }
+            }
+
+
+            stage('Build'){
+                steps{
+                    echo '--------------------------------[ Started build ]--------------------------------'
+                    script {
+
+                        String[] servers = pipelineParams.ipServer.split(",")
+                        for(server in servers) {
+
+                            def remote = [:]
+                            remote.name = 'server'
+                            remote.host = server
+                            remote.allowAnyHosts = true
+
+                            withCredentials([usernamePassword(credentialsId: '8827ee84-4ad4-4266-a11f-1f7f5fd74410', usernameVariable: 'NUSER', passwordVariable: 'NPASS')]) {
+                                remote.user = NUSER
+                                remote.password = NPASS
+                            }
+
+                            echo ' --- Build --- '
+
+                            def container
+                            int commandResultLength
+                            int serviceNameLength
+
+                            String[] serviceNames = pipelineParams.serviceName.split(",")
+
+                            for (int i = 0; i < serviceNames.size(); i++) {
+
+                                try {
+                                    container = sshCommand remote: remote, command: "docker ps -a --format 'table {{.Names}}' |grep ${serviceNames[i]}"
+                                    commandResultLength = container.length()
+                                    serviceNameLength = serviceNames[i].length()
+                                } catch (Exception ex) {
+                                    container = 'null'
+                                }
+
+                                def image
+                                boolean validateDocker = true
+                                if (container != 'null') {
+                                    try {
+                                        echo ' --- Paso 01: Parar docker  --- '
+                                        sshCommand remote: remote, command: "docker stop ${serviceNames[i]}"
+                                    } catch (Exception ex) {
+                                        echo ' --- No existe docker para ejecutar comando docker stop --- '
+                                    }
+
+                                    try {
+                                        echo ' --- Paso 02: Eliminar docker  --- '
+                                        image = sshCommand remote: remote, command: "docker inspect --format='{{.Image}} {{.Name}}' \$(docker ps -aq) |grep /${serviceNames[i]}"
+                                        sshCommand remote: remote, command: "docker rm ${serviceNames[i]}"
+                                    } catch (Exception ex) {
+                                        validateDocker = false
+                                        echo ' --- No existe docker para ejecutar comando docker rm --- '
+                                    }
+
+                                    if ( commandResultLength == serviceNameLength && validateDocker) {
+                                        echo ' --- Paso 03: Eliminar imagen ' + image + ' --- '
+                                        String[] id = image.split(" ")
+                                        sshCommand remote: remote, command: "docker rmi -f " + id[0]
+                                    } else {
+                                        echo ' --- La imagen es compartida por mas de un contenedor no se puede eliminar --- '
+                                    }
+                                }
+                                echo ' --- Construyendo docker '
+
+                                sshCommand remote: remote, command: "cd /home/celuman/deployDocker/${serviceNames[i]} && docker-compose up -d --build  ${serviceNames[i]}"
+                            }
+                        }
+                    }
+                    echo '--------------------------------[ Ended build ]--------------------------------'
+                }
+            }
+
+        }
+
+        post {
+            success {
+                script{
+                    echo 'Building finished successfully'
+                    pipelineParams.status = "success"
+                    functions.audit(pipelineParams)
+                }
+            }
+            failure {
+                script{
+                    echo 'A Building error has occurred '
+                    pipelineParams.status = "failure"
+                    functions.audit(pipelineParams)
+                }
+            }
+        }
+    }
+}
